@@ -6805,7 +6805,12 @@ void intel_dp_mst_resume(struct drm_i915_private *dev_priv)
 			continue;
 
 		ret = drm_dp_mst_topology_mgr_resume(&intel_dp->mst_mgr);
-		if (ret)
+		/* A full reset is required */
+		if (ret == -EINVAL) {
+			drm_dp_mst_topology_mgr_set_mst(&intel_dp->mst_mgr, false);
+			intel_dp_configure_mst(intel_dp);
+		} else if (ret != 0) {
 			intel_dp_check_mst_status(intel_dp);
+		}
 	}
 }
