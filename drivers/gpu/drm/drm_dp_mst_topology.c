@@ -29,6 +29,7 @@
 #include <linux/i2c.h>
 #include <drm/drm_dp_mst_helper.h>
 #include <drm/drmP.h>
+#include <drm/drm_edid.h>
 
 #include <drm/drm_fixed.h>
 #include <drm/drm_atomic.h>
@@ -2204,6 +2205,64 @@ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr)
 }
 EXPORT_SYMBOL(drm_dp_mst_topology_mgr_suspend);
 
+static bool drm_dp_mst_edids_changed(struct drm_dp_mst_topology_mgr *mgr,
+				     struct drm_dp_mst_port *port)
+{
+	struct drm_device *dev;
+	struct drm_connector *connector;
+	struct drm_dp_mst_port *dport;
+	struct drm_dp_mst_branch *mstb;
+	struct edid *current_edid, *cached_edid;
+	bool ret = false;
+
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return false;
+
+	mstb = drm_dp_get_validated_mstb_ref(mgr, port->mstb);
+	if (mstb) {
+		list_for_each_entry(dport, &port->mstb->ports, next) {
+			ret = drm_dp_mst_edids_changed(mgr, dport);
+			if (ret)
+				break;
+		}
+
+		drm_dp_put_mst_branch_device(mstb);
+		if (ret)
+			goto out;
+	}
+
+	connector = port->connector;
+	if (!connector || !port->aux.ddc.algo)
+		goto out;
+
+	dev = connector->dev;
+	mutex_lock(&dev->mode_config.mutex);
+
+	current_edid = drm_get_edid(connector, &port->aux.ddc);
+	if (connector->edid_blob_ptr)
+		cached_edid = (void *)connector->edid_blob_ptr->data;
+	else
+		return false;
+
+	if ((current_edid && cached_edid && memcmp(current_edid, cached_edid,
+						   sizeof(struct edid)) != 0) ||
+	    (!current_edid && cached_edid) || (current_edid && !cached_edid)) {
+		ret = true;
+		DRM_DEBUG_KMS("EDID on %s changed, reprobing connectors\n",
+			      connector->name);
+	}
+
+	mutex_unlock(&dev->mode_config.mutex);
+
+	kfree(current_edid);
+
+out:
+	drm_dp_put_port(port);
+
+	return ret;
+}
+
 /**
  * drm_dp_mst_topology_mgr_resume() - resume the MST manager
  * @mgr: manager to resume
@@ -2213,9 +2272,15 @@ EXPORT_SYMBOL(drm_dp_mst_topology_mgr_suspend);
  *
  * if the device fails this returns -1, and the driver should do
  * a full MST reprobe, in case we were undocked.
+ *
+ * if the device can no longer be trusted, this returns -EINVAL
+ * and the driver should unconditionally disconnect and reconnect
+ * the dock.
  */
 int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr)
 {
+	struct drm_dp_mst_branch *mstb;
+	struct drm_dp_mst_port *port;
 	int ret = 0;
 
 	mutex_lock(&mgr->lock);
@@ -2249,8 +2314,35 @@ int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr)
 		drm_dp_check_mstb_guid(mgr->mst_primary, guid);
 
 		ret = 0;
-	} else
+
+		/*
+		 * Some hubs also forget to notify us of hotplugs that happened
+		 * while we were in suspend, so we need to verify that the edid
+		 * hasn't changed for any of the connectors. If it has been,
+		 * we unfortunately can't rely on the dock updating us with
+		 * hotplug events, so indicate we need a full reconnect.
+		 */
+
+		/* MST's I2C helpers can't be used while holding this lock */
+		mutex_unlock(&mgr->lock);
+
+		mstb = drm_dp_get_validated_mstb_ref(mgr, mgr->mst_primary);
+		if (mstb) {
+			list_for_each_entry(port, &mstb->ports, next) {
+				if (drm_dp_mst_edids_changed(mgr, port)) {
+					ret = -EINVAL;
+					break;
+				}
+			}
+
+			drm_dp_put_mst_branch_device(mstb);
+		}
+	} else {
 		ret = -1;
+		mutex_unlock(&mgr->lock);
+	}
+
+	return ret;
 
 out_unlock:
 	mutex_unlock(&mgr->lock);
