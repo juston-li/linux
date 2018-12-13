@@ -2237,13 +2237,10 @@ static bool drm_dp_mst_edids_changed(struct drm_dp_mst_topology_mgr *mgr,
 		goto out;
 
 	dev = connector->dev;
-	mutex_lock(&dev->mode_config.mutex);
 
 	current_edid = drm_get_edid(connector, &port->aux.ddc);
-	if (connector->edid_blob_ptr)
-		cached_edid = (void *)connector->edid_blob_ptr->data;
-	else
-		return false;
+	if (port->cached_edid)
+		cached_edid = drm_edid_duplicate(port->cached_edid);
 
 	if ((current_edid && cached_edid && memcmp(current_edid, cached_edid,
 						   sizeof(struct edid)) != 0) ||
@@ -2252,8 +2249,6 @@ static bool drm_dp_mst_edids_changed(struct drm_dp_mst_topology_mgr *mgr,
 		DRM_DEBUG_KMS("EDID on %s changed, reprobing connectors\n",
 			      connector->name);
 	}
-
-	mutex_unlock(&dev->mode_config.mutex);
 
 	kfree(current_edid);
 
