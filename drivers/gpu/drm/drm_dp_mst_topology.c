@@ -2258,6 +2258,74 @@ out:
 	return ret;
 }
 
+static bool drm_dp_mst_peer_device_types_changed(struct drm_dp_mst_topology_mgr *mgr)
+{
+        struct drm_dp_mst_branch *mstb;
+	struct drm_dp_mst_port *port;
+	struct drm_dp_sideband_msg_tx *txmsg;
+	int len;
+	bool ret = false;
+
+	mstb = drm_dp_get_validated_mstb_ref(mgr, mgr->mst_primary);
+	if (mstb) {
+		txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+		if (!txmsg)
+			goto out;
+
+		txmsg->dst = mstb;
+		len = build_link_address(txmsg);
+
+		drm_dp_queue_down_tx(mgr, txmsg);
+
+		ret = drm_dp_mst_wait_tx_reply(mstb, txmsg);
+		if (ret > 0) {
+			int i;
+
+			if (txmsg->reply.reply_type == 1)
+				DRM_DEBUG_KMS("link address nak received\n");
+			else {
+				DRM_DEBUG_KMS("link address reply: %d\n", txmsg->reply.u.link_addr.nports);
+				for (i = 0; i < txmsg->reply.u.link_addr.nports; i++) {
+					DRM_DEBUG_KMS("JHLI: port %d: input %d, pdt: %d, pn: %d, dpcd_rev: %02x, mcs: %d, ddps: %d, ldps %d, sdp %d/%d\n", i,
+					       txmsg->reply.u.link_addr.ports[i].input_port,
+					       txmsg->reply.u.link_addr.ports[i].peer_device_type,
+					       txmsg->reply.u.link_addr.ports[i].port_number,
+					       txmsg->reply.u.link_addr.ports[i].dpcd_revision,
+					       txmsg->reply.u.link_addr.ports[i].mcs,
+					       txmsg->reply.u.link_addr.ports[i].ddps,
+					       txmsg->reply.u.link_addr.ports[i].legacy_device_plug_status,
+					       txmsg->reply.u.link_addr.ports[i].num_sdp_streams,
+					       txmsg->reply.u.link_addr.ports[i].num_sdp_stream_sinks);
+				}
+			}
+		} else {
+			DRM_DEBUG_KMS("link address failed %d\n", ret);
+			goto out;
+		}
+
+
+		list_for_each_entry(port, &mstb->ports, next) {
+			int i;
+			for (i = 0; i < txmsg->reply.u.link_addr.nports; i++) {
+				if (port->port_num == txmsg->reply.u.link_addr.ports[i].port_number) {
+					DRM_DEBUG_KMS("JHLI: new Port pdt: %d",  txmsg->reply.u.link_addr.ports[i].peer_device_type);
+					DRM_DEBUG_KMS("JHLI: old Port pdt: %d",  port->pdt);
+					if (port->pdt != txmsg->reply.u.link_addr.ports[i].peer_device_type) {
+						kfree(txmsg);
+						return true;
+					}
+				}
+			}
+		}
+
+		kfree(txmsg);
+	}
+
+out:
+	drm_dp_put_mst_branch_device(mstb);
+	return ret;
+}
+
 /**
  * drm_dp_mst_topology_mgr_resume() - resume the MST manager
  * @mgr: manager to resume
@@ -2324,6 +2392,11 @@ int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr)
 		mstb = drm_dp_get_validated_mstb_ref(mgr, mgr->mst_primary);
 		if (mstb) {
 			list_for_each_entry(port, &mstb->ports, next) {
+				if(drm_dp_mst_peer_device_types_changed(mgr)) {
+					ret = -EINVAL;
+					break;
+				}
+
 				if (drm_dp_mst_edids_changed(mgr, port)) {
 					ret = -EINVAL;
 					break;
